@@ -61,8 +61,7 @@ pub enum EscrowError {
 
 // ─── STORAGE KEYS ─────────────────────────────
 
-const ESCROW_KEY: symbol_short!("ESCROW") = symbol_short!("ESCROW");
-const INIT_KEY: symbol_short!("INIT") = symbol_short!("INIT");
+// Storage keys — used inline as symbol_short!("ESCROW") and symbol_short!("INIT")
 
 // ─── CONTRACT ─────────────────────────────────
 
@@ -87,7 +86,7 @@ impl StellarPodEscrow {
         expires_at: u64,
     ) -> Result<(), EscrowError> {
         // Prevent double initialization
-        if env.storage().persistent().has(&INIT_KEY) {
+        if env.storage().persistent().has(&symbol_short!("INIT")) {
             return Err(EscrowError::AlreadyInitialized);
         }
 
@@ -126,12 +125,12 @@ impl StellarPodEscrow {
             created_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&ESCROW_KEY, &escrow);
-        env.storage().persistent().set(&INIT_KEY, &true);
+        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
+        env.storage().persistent().set(&symbol_short!("INIT"), &true);
 
         // Extend TTL để storage không bị xóa (30 ngày min, 90 ngày max)
-        env.storage().persistent().extend_ttl(&ESCROW_KEY, 2_592_000, 7_776_000);
-        env.storage().persistent().extend_ttl(&INIT_KEY, 2_592_000, 7_776_000);
+        env.storage().persistent().extend_ttl(&symbol_short!("ESCROW"), 2_592_000, 7_776_000);
+        env.storage().persistent().extend_ttl(&symbol_short!("INIT"), 2_592_000, 7_776_000);
 
         Ok(())
     }
@@ -167,7 +166,7 @@ impl StellarPodEscrow {
         }
 
         escrow.state = EscrowState::Released;
-        env.storage().persistent().set(&ESCROW_KEY, &escrow);
+        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
 
         Ok(())
     }
@@ -201,7 +200,7 @@ impl StellarPodEscrow {
         usdc.transfer(&contract, &escrow.merchant, &escrow.amount);
 
         escrow.state = EscrowState::Refunded;
-        env.storage().persistent().set(&ESCROW_KEY, &escrow);
+        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
 
         Ok(())
     }
@@ -222,7 +221,7 @@ impl StellarPodEscrow {
         }
 
         escrow.state = EscrowState::Disputed;
-        env.storage().persistent().set(&ESCROW_KEY, &escrow);
+        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
 
         Ok(())
     }
@@ -272,7 +271,7 @@ impl StellarPodEscrow {
         }
 
         escrow.state = EscrowState::Released;
-        env.storage().persistent().set(&ESCROW_KEY, &escrow);
+        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
 
         Ok(())
     }
@@ -306,7 +305,7 @@ impl StellarPodEscrow {
     fn get_escrow(env: &Env) -> Result<EscrowData, EscrowError> {
         env.storage()
             .persistent()
-            .get(&ESCROW_KEY)
+            .get(&symbol_short!("ESCROW"))
             .ok_or(EscrowError::NotInitialized)
     }
 }
