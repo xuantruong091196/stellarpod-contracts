@@ -1,18 +1,20 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short,
+    contract, contractimpl, contracttype, contracterror,
     Address, Env, String, token,
 };
 
 // ═══════════════════════════════════════════════
-// STELLARPOD ESCROW CONTRACT — SOROBAN
+// STELO ESCROW CONTRACT — SOROBAN (Multi-Escrow)
 //
-// Luồng hoạt động:
-// 1. Merchant gọi `lock()` → USDC chuyển vào contract
-// 2. Provider hoàn thành đơn → Arbiter gọi `release()`
-// 3. Nếu tranh chấp → `dispute()` → `resolve_dispute()`
-// 4. Nếu quá hạn → `refund()` (ai cũng có thể gọi)
+// A single contract instance handles N escrows, keyed by order_id.
+//
+// Flow per escrow:
+// 1. Merchant calls `lock(order_id, ...)` → USDC transferred into contract
+// 2. Provider fulfils → Arbiter calls `release(order_id)`
+// 3. Dispute → `dispute(order_id)` → `resolve_dispute(order_id, %)`
+// 4. Expired → `refund(order_id)` (anyone can call)
 // ═══════════════════════════════════════════════
 
 // ─── DATA TYPES ───────────────────────────────
@@ -27,18 +29,18 @@ pub enum EscrowState {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EscrowData {
     pub merchant: Address,
     pub provider: Address,
-    pub arbiter: Address,        // StellarPOD platform address
-    pub usdc_token: Address,     // USDC token contract on Stellar
-    pub amount: i128,            // Tổng USDC (bao gồm platform fee)
-    pub platform_fee: i128,      // Phí StellarPOD (2-5%)
-    pub provider_amount: i128,   // = amount - platform_fee
+    pub arbiter: Address,
+    pub usdc_token: Address,
+    pub amount: i128,
+    pub platform_fee: i128,
+    pub provider_amount: i128,
     pub state: EscrowState,
-    pub order_id: String,        // Off-chain order reference
-    pub expires_at: u64,         // Unix timestamp — auto-refund deadline
+    pub order_id: String,
+    pub expires_at: u64,
     pub created_at: u64,
 }
 
@@ -46,8 +48,8 @@ pub struct EscrowData {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum EscrowError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
+    AlreadyExists = 1,
+    NotFound = 2,
     InvalidAmount = 3,
     InvalidFee = 4,
     AlreadyExpired = 5,
@@ -56,24 +58,26 @@ pub enum EscrowError {
     NotAuthorized = 8,
     NotExpired = 9,
     InvalidPercent = 10,
-    TransferFailed = 11,
+    Overflow = 11,
 }
 
-// ─── STORAGE KEYS ─────────────────────────────
+// ─── STORAGE ─────────────────────────────────
 
-// Storage keys — used inline as symbol_short!("ESCROW") and symbol_short!("INIT")
+/// Each escrow is keyed by its order_id via this enum.
+#[contracttype]
+enum DataKey {
+    Escrow(String),
+}
 
 // ─── CONTRACT ─────────────────────────────────
 
 #[contract]
-pub struct StellarPodEscrow;
+pub struct SteloEscrow;
 
 #[contractimpl]
-impl StellarPodEscrow {
-    /// Tạo escrow mới và khóa USDC từ merchant wallet vào contract.
-    ///
-    /// Merchant phải approve USDC transfer trước khi gọi hàm này.
-    /// Arbiter là StellarPOD platform address — có quyền release/refund/resolve.
+impl SteloEscrow {
+    /// Create a new escrow and lock USDC from merchant into the contract.
+    /// Each order_id can only be used once.
     pub fn lock(
         env: Env,
         merchant: Address,
@@ -85,15 +89,15 @@ impl StellarPodEscrow {
         order_id: String,
         expires_at: u64,
     ) -> Result<(), EscrowError> {
-        // Prevent double initialization
-        if env.storage().persistent().has(&symbol_short!("INIT")) {
-            return Err(EscrowError::AlreadyInitialized);
+        let key = DataKey::Escrow(order_id.clone());
+
+        // Prevent duplicate escrow for same order
+        if env.storage().persistent().has(&key) {
+            return Err(EscrowError::AlreadyExists);
         }
 
-        // Merchant phải authorize transaction này
         merchant.require_auth();
 
-        // Validate inputs
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
         }
@@ -104,13 +108,14 @@ impl StellarPodEscrow {
             return Err(EscrowError::AlreadyExpired);
         }
 
-        let provider_amount = amount - platform_fee;
+        let provider_amount = amount
+            .checked_sub(platform_fee)
+            .ok_or(EscrowError::Overflow)?;
 
         // Transfer USDC: merchant → contract
         let usdc = token::Client::new(&env, &usdc_token);
         usdc.transfer(&merchant, &env.current_contract_address(), &amount);
 
-        // Lưu escrow data
         let escrow = EscrowData {
             merchant,
             provider,
@@ -125,31 +130,22 @@ impl StellarPodEscrow {
             created_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
-        env.storage().persistent().set(&symbol_short!("INIT"), &true);
-
-        // Extend TTL để storage không bị xóa (30 ngày min, 90 ngày max)
-        env.storage().persistent().extend_ttl(&symbol_short!("ESCROW"), 2_592_000, 7_776_000);
-        env.storage().persistent().extend_ttl(&symbol_short!("INIT"), 2_592_000, 7_776_000);
+        env.storage().persistent().set(&key, &escrow);
+        env.storage().persistent().extend_ttl(&key, 2_592_000, 7_776_000);
 
         Ok(())
     }
 
-    /// Giải ngân cho provider sau khi đơn hàng delivered.
-    ///
-    /// Chỉ arbiter (StellarPOD) hoặc merchant có thể gọi.
-    /// Flow: provider_amount → provider, platform_fee → arbiter (treasury)
-    pub fn release(env: Env, caller: Address) -> Result<(), EscrowError> {
+    /// Release escrow funds to provider + platform fee to arbiter.
+    /// Only arbiter or merchant can call.
+    pub fn release(env: Env, caller: Address, order_id: String) -> Result<(), EscrowError> {
         caller.require_auth();
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = Self::get_escrow(&env, &key)?;
 
-        let mut escrow = Self::get_escrow(&env)?;
-
-        // Chỉ arbiter hoặc merchant được release
         if caller != escrow.arbiter && caller != escrow.merchant {
             return Err(EscrowError::NotAuthorized);
         }
-
-        // Phải đang ở trạng thái Locked
         if escrow.state != EscrowState::Locked {
             return Err(EscrowError::NotLocked);
         }
@@ -157,97 +153,75 @@ impl StellarPodEscrow {
         let usdc = token::Client::new(&env, &escrow.usdc_token);
         let contract = env.current_contract_address();
 
-        // Chuyển tiền cho provider
         usdc.transfer(&contract, &escrow.provider, &escrow.provider_amount);
-
-        // Chuyển phí cho arbiter (StellarPOD treasury)
         if escrow.platform_fee > 0 {
             usdc.transfer(&contract, &escrow.arbiter, &escrow.platform_fee);
         }
 
         escrow.state = EscrowState::Released;
-        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
-
+        env.storage().persistent().set(&key, &escrow);
         Ok(())
     }
 
-    /// Hoàn tiền toàn bộ cho merchant.
-    ///
-    /// Có thể gọi khi:
-    /// - Escrow đã quá hạn (ai cũng gọi được)
-    /// - Arbiter quyết định refund sau dispute
-    pub fn refund(env: Env, caller: Address) -> Result<(), EscrowError> {
+    /// Refund full amount to merchant.
+    /// Anyone can call after expiry. Only arbiter before expiry.
+    pub fn refund(env: Env, caller: Address, order_id: String) -> Result<(), EscrowError> {
         caller.require_auth();
-
-        let mut escrow = Self::get_escrow(&env)?;
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = Self::get_escrow(&env, &key)?;
 
         let is_expired = env.ledger().timestamp() > escrow.expires_at;
-
-        // Nếu chưa expired, chỉ arbiter được refund
         if !is_expired && caller != escrow.arbiter {
             return Err(EscrowError::NotAuthorized);
         }
-
-        // Phải đang Locked hoặc Disputed
         if escrow.state != EscrowState::Locked && escrow.state != EscrowState::Disputed {
             return Err(EscrowError::NotLocked);
         }
 
         let usdc = token::Client::new(&env, &escrow.usdc_token);
-        let contract = env.current_contract_address();
-
-        // Hoàn toàn bộ về merchant
-        usdc.transfer(&contract, &escrow.merchant, &escrow.amount);
+        usdc.transfer(&env.current_contract_address(), &escrow.merchant, &escrow.amount);
 
         escrow.state = EscrowState::Refunded;
-        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
-
+        env.storage().persistent().set(&key, &escrow);
         Ok(())
     }
 
-    /// Merchant hoặc provider raise dispute — freeze escrow.
-    pub fn dispute(env: Env, caller: Address) -> Result<(), EscrowError> {
+    /// Merchant or provider raises a dispute — freezes the escrow.
+    pub fn dispute(env: Env, caller: Address, order_id: String) -> Result<(), EscrowError> {
         caller.require_auth();
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = Self::get_escrow(&env, &key)?;
 
-        let mut escrow = Self::get_escrow(&env)?;
-
-        // Chỉ merchant hoặc provider được raise dispute
         if caller != escrow.merchant && caller != escrow.provider {
             return Err(EscrowError::NotAuthorized);
         }
-
         if escrow.state != EscrowState::Locked {
             return Err(EscrowError::NotLocked);
         }
 
         escrow.state = EscrowState::Disputed;
-        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
-
+        env.storage().persistent().set(&key, &escrow);
         Ok(())
     }
 
-    /// Arbiter giải quyết tranh chấp bằng cách chia tiền theo tỷ lệ.
-    ///
-    /// Ví dụ: provider làm được 70% → provider_percent = 70
-    /// → 70% net amount → provider, 30% → merchant, platform_fee → arbiter
+    /// Arbiter resolves dispute by splitting funds between provider and merchant.
+    /// provider_percent: 0..=100 — percentage of net (amount - fee) going to provider.
     pub fn resolve_dispute(
         env: Env,
         caller: Address,
+        order_id: String,
         provider_percent: u32,
     ) -> Result<(), EscrowError> {
         caller.require_auth();
+        let key = DataKey::Escrow(order_id);
+        let mut escrow = Self::get_escrow(&env, &key)?;
 
-        let mut escrow = Self::get_escrow(&env)?;
-
-        // Chỉ arbiter được resolve
         if caller != escrow.arbiter {
             return Err(EscrowError::NotAuthorized);
         }
-
         if escrow.state != EscrowState::Disputed {
             return Err(EscrowError::NotDisputed);
         }
-
         if provider_percent > 100 {
             return Err(EscrowError::InvalidPercent);
         }
@@ -255,10 +229,16 @@ impl StellarPodEscrow {
         let usdc = token::Client::new(&env, &escrow.usdc_token);
         let contract = env.current_contract_address();
 
-        // Tính split (trừ platform fee luôn về arbiter)
-        let net = escrow.amount - escrow.platform_fee;
-        let to_provider = (net * provider_percent as i128) / 100;
-        let to_merchant = net - to_provider;
+        let net = escrow.amount
+            .checked_sub(escrow.platform_fee)
+            .ok_or(EscrowError::Overflow)?;
+        let to_provider = net
+            .checked_mul(provider_percent as i128)
+            .ok_or(EscrowError::Overflow)?
+            / 100;
+        let to_merchant = net
+            .checked_sub(to_provider)
+            .ok_or(EscrowError::Overflow)?;
 
         if to_provider > 0 {
             usdc.transfer(&contract, &escrow.provider, &to_provider);
@@ -271,42 +251,34 @@ impl StellarPodEscrow {
         }
 
         escrow.state = EscrowState::Released;
-        env.storage().persistent().set(&symbol_short!("ESCROW"), &escrow);
-
+        env.storage().persistent().set(&key, &escrow);
         Ok(())
     }
 
     // ─── READ-ONLY QUERIES ────────────────────
 
-    /// Lấy trạng thái escrow hiện tại
-    pub fn get_state(env: Env) -> Result<EscrowData, EscrowError> {
-        Self::get_escrow(&env)
+    pub fn get_state(env: Env, order_id: String) -> Result<EscrowData, EscrowError> {
+        Self::get_escrow(&env, &DataKey::Escrow(order_id))
     }
 
-    /// Kiểm tra escrow đã expired chưa
-    pub fn is_expired(env: Env) -> Result<bool, EscrowError> {
-        let escrow = Self::get_escrow(&env)?;
+    pub fn is_expired(env: Env, order_id: String) -> Result<bool, EscrowError> {
+        let escrow = Self::get_escrow(&env, &DataKey::Escrow(order_id))?;
         Ok(env.ledger().timestamp() > escrow.expires_at)
     }
 
-    /// Lấy thời gian còn lại trước khi expired (giây)
-    pub fn time_remaining(env: Env) -> Result<u64, EscrowError> {
-        let escrow = Self::get_escrow(&env)?;
+    pub fn time_remaining(env: Env, order_id: String) -> Result<u64, EscrowError> {
+        let escrow = Self::get_escrow(&env, &DataKey::Escrow(order_id))?;
         let now = env.ledger().timestamp();
-        if now >= escrow.expires_at {
-            Ok(0)
-        } else {
-            Ok(escrow.expires_at - now)
-        }
+        if now >= escrow.expires_at { Ok(0) } else { Ok(escrow.expires_at - now) }
     }
 
-    // ─── INTERNAL HELPERS ─────────────────────
+    // ─── INTERNAL ─────────────────────────────
 
-    fn get_escrow(env: &Env) -> Result<EscrowData, EscrowError> {
+    fn get_escrow(env: &Env, key: &DataKey) -> Result<EscrowData, EscrowError> {
         env.storage()
             .persistent()
-            .get(&symbol_short!("ESCROW"))
-            .ok_or(EscrowError::NotInitialized)
+            .get(key)
+            .ok_or(EscrowError::NotFound)
     }
 }
 
