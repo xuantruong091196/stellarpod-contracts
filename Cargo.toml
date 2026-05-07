@@ -4,6 +4,7 @@ members = [
     "contracts/escrow",
     "contracts/escrow_v2",
     "contracts/stelo_nft",
+    "contracts/stelo_marketplace",
 ]
 
 [workspace.dependencies]

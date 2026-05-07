@@ -1321,6 +1321,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stellarpod-stelo-marketplace"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "soroban-token-sdk",
+]
+
+[[package]]
 name = "stellarpod-stelo-nft"
 version = "0.1.0"
 dependencies = [
