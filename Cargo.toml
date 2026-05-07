@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "contracts/escrow",
     "contracts/escrow_v2",
+    "contracts/stelo_nft",
 ]
 
 [workspace.dependencies]
