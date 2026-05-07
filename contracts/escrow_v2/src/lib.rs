@@ -54,3 +54,6 @@ impl EscrowV2 {
         dispute::resolve_dispute(env, arbiter, order_id, provider_bps)
     }
 }
+
+#[cfg(test)]
+mod test;
